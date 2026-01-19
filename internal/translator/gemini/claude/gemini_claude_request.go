@@ -109,6 +109,22 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						part, _ = sjson.Set(part, "functionResponse.name", funcName)
 						part, _ = sjson.Set(part, "functionResponse.response.result", responseData)
 						contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
+
+					case "thinking":
+						// Handle Claude thinking blocks - convert to Gemini thought parts with signature
+						// Per Gemini docs: Gemini 3 must pass back thoughtSignature during function calling
+						thinkingText := contentResult.Get("thinking").String()
+						signature := contentResult.Get("signature").String()
+						if thinkingText != "" || signature != "" {
+							part := `{"thought":true,"text":""}`
+							if thinkingText != "" {
+								part, _ = sjson.Set(part, "text", thinkingText)
+							}
+							if signature != "" {
+								part, _ = sjson.Set(part, "thoughtSignature", signature)
+							}
+							contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
+						}
 					}
 					return true
 				})

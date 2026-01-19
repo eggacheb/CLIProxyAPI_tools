@@ -107,8 +107,17 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			if partTextResult.Exists() {
 				// Process thinking content (internal reasoning)
 				if partResult.Get("thought").Bool() {
-					// Continue existing thinking block
-					if (*param).(*Params).ResponseType == 2 {
+					// Check for thoughtSignature and emit signature_delta if present
+					if thoughtSignature := partResult.Get("thoughtSignature"); thoughtSignature.Exists() && thoughtSignature.String() != "" {
+						// If we're in thinking state, emit the signature_delta
+						if (*param).(*Params).ResponseType == 2 {
+							output = output + "event: content_block_delta\n"
+							sigData, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, (*param).(*Params).ResponseIndex), "delta.signature", thoughtSignature.String())
+							output = output + fmt.Sprintf("data: %s\n\n\n", sigData)
+							(*param).(*Params).HasContent = true
+						}
+					} else if (*param).(*Params).ResponseType == 2 {
+						// Continue existing thinking block (no signature yet)
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, (*param).(*Params).ResponseIndex), "delta.thinking", partTextResult.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
@@ -117,11 +126,6 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 						// Transition from another state to thinking
 						// First, close any existing content block
 						if (*param).(*Params).ResponseType != 0 {
-							if (*param).(*Params).ResponseType == 2 {
-								// output = output + "event: content_block_delta\n"
-								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, (*param).(*Params).ResponseIndex)
-								// output = output + "\n\n\n"
-							}
 							output = output + "event: content_block_stop\n"
 							output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex)
 							output = output + "\n\n\n"
@@ -130,7 +134,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 
 						// Start a new thinking content block
 						output = output + "event: content_block_start\n"
-						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, (*param).(*Params).ResponseIndex)
+						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":"","signature":""}}`, (*param).(*Params).ResponseIndex)
 						output = output + "\n\n\n"
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, (*param).(*Params).ResponseIndex), "delta.thinking", partTextResult.String())

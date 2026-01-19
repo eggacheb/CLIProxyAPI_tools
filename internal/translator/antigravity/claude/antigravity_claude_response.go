@@ -9,12 +9,14 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/mcp"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/tidwall/gjson"
@@ -39,10 +41,28 @@ type Params struct {
 	HasSentFinalEvents   bool   // Indicates if final content/message events have been sent
 	HasToolUse           bool   // Indicates if tool use was observed in the stream
 	HasContent           bool   // Tracks whether any content (text, thinking, or tool use) has been output
+	HasThinking          bool   // Tracks if any thinking content has been output (for signature handling)
 
 	// Signature caching support
 	SessionID           string          // Session ID derived from request for signature caching
 	CurrentThinkingText strings.Builder // Accumulates thinking text for signature caching
+
+	// Signature edge case handling (per Antigravity2Api patterns)
+	TrailingSignature           string // Signature from empty text part, must be emitted via empty thinking block
+	PendingToolThoughtSignature string // Signature from empty thought part for subsequent functionCall
+
+	// Web Search Grounding support
+	WebSearchMode           bool     // Indicates if grounding metadata was detected
+	WebSearchToolUseID      string   // Tool use ID for web_search
+	WebSearchQuery          string   // Search query from groundingMetadata
+	WebSearchResults        []string // JSON strings of web_search_result items
+	WebSearchSupports       []string // JSON strings of groundingSupports
+	WebSearchBufferedTexts  []string // Buffered non-thinking text parts for final emission
+
+	// MCP XML Bridge support (per Antigravity2Api's mcpXmlBridge.js)
+	McpXmlEnabled   bool     // Indicates if MCP XML mode is enabled
+	McpToolNames    []string // List of MCP tool names (mcp__* prefix)
+	McpXmlBuffer    string   // Buffer for incomplete XML tags in streaming text
 }
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
@@ -131,24 +151,76 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
 
+			// Extract thoughtSignature if present
+			thoughtSignature := partResult.Get("thoughtSignature").String()
+			if thoughtSignature == "" {
+				thoughtSignature = partResult.Get("thought_signature").String()
+			}
+
+			// Handle signature edge cases per Antigravity2Api patterns
+			isThoughtPart := partResult.Get("thought").Bool()
+			isEmptyThoughtPart := isThoughtPart && partTextResult.Exists() && partTextResult.String() == ""
+
+			// Clear pendingToolThoughtSignature if we encounter non-FC, non-empty-thought content
+			if params.PendingToolThoughtSignature != "" && !functionCallResult.Exists() && !isEmptyThoughtPart {
+				params.PendingToolThoughtSignature = ""
+			}
+
+			// Handle empty text with signature: store as trailingSignature
+			if partTextResult.Exists() && !isThoughtPart && partTextResult.String() == "" {
+				if thoughtSignature != "" {
+					params.TrailingSignature = thoughtSignature
+				}
+				continue // Skip empty text parts
+			}
+
 			// Handle text content (both regular content and thinking)
 			if partTextResult.Exists() {
 				// Process thinking content (internal reasoning)
-				if partResult.Get("thought").Bool() {
-					if thoughtSignature := partResult.Get("thoughtSignature"); thoughtSignature.Exists() && thoughtSignature.String() != "" {
-						// log.Debug("Branch: signature_delta")
+				if isThoughtPart {
+					params.HasThinking = true
 
+					// Handle trailingSignature: must emit via empty thinking block before processing new thinking
+					if params.TrailingSignature != "" {
+						output = output + "event: content_block_start\n"
+						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":"","signature":""}}`, params.ResponseIndex)
+						output = output + "\n\n\n"
+						output = output + "event: content_block_delta\n"
+						output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)
+						output = output + "\n\n\n"
+						output = output + "event: content_block_delta\n"
+						sigData, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex), "delta.signature", params.TrailingSignature)
+						output = output + fmt.Sprintf("data: %s\n\n\n", sigData)
+						output = output + "event: content_block_stop\n"
+						output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+						output = output + "\n\n\n"
+						params.ResponseIndex++
+						params.TrailingSignature = ""
+						params.HasContent = true
+					}
+
+					// Handle signature on thought part
+					if thoughtSignature != "" {
+						// Cache signature for later retrieval
 						if params.SessionID != "" && params.CurrentThinkingText.Len() > 0 {
-							cache.CacheSignature(params.SessionID, params.CurrentThinkingText.String(), thoughtSignature.String())
-							// log.Debugf("Cached signature for thinking block (sessionID=%s, textLen=%d)", params.SessionID, params.CurrentThinkingText.Len())
+							cache.CacheSignature(params.SessionID, params.CurrentThinkingText.String(), thoughtSignature)
 							params.CurrentThinkingText.Reset()
 						}
 
-						output = output + "event: content_block_delta\n"
-						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex), "delta.signature", thoughtSignature.String())
-						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						params.HasContent = true
-					} else if params.ResponseType == 2 { // Continue existing thinking block if already in thinking state
+						// Empty thought with signature: store for subsequent functionCall
+						if isEmptyThoughtPart {
+							params.PendingToolThoughtSignature = thoughtSignature
+						}
+
+						// Emit signature_delta if in thinking state
+						if params.ResponseType == 2 {
+							output = output + "event: content_block_delta\n"
+							data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex), "delta.signature", thoughtSignature)
+							output = output + fmt.Sprintf("data: %s\n\n\n", data)
+							params.HasContent = true
+						}
+					} else if params.ResponseType == 2 {
+						// Continue existing thinking block (no signature yet)
 						params.CurrentThinkingText.WriteString(partTextResult.String())
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex), "delta.thinking", partTextResult.String())
@@ -158,11 +230,6 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 						// Transition from another state to thinking
 						// First, close any existing content block
 						if params.ResponseType != 0 {
-							if params.ResponseType == 2 {
-								// output = output + "event: content_block_delta\n"
-								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, params.ResponseIndex)
-								// output = output + "\n\n\n"
-							}
 							output = output + "event: content_block_stop\n"
 							output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
 							output = output + "\n\n\n"
@@ -171,7 +238,7 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 
 						// Start a new thinking content block
 						output = output + "event: content_block_start\n"
-						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, params.ResponseIndex)
+						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":"","signature":""}}`, params.ResponseIndex)
 						output = output + "\n\n\n"
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex), "delta.thinking", partTextResult.String())
@@ -185,11 +252,22 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 				} else {
 					finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason")
 					if partTextResult.String() != "" || !finishReasonResult.Exists() {
+						textContent := partTextResult.String()
+
+						// Check for MCP XML tool calls in text content
+						if params.McpXmlEnabled && len(params.McpToolNames) > 0 && textContent != "" {
+							mcpOutput, foundTool := processMcpXmlText(textContent, params)
+							if foundTool {
+								output = output + mcpOutput
+								continue // Skip normal text processing
+							}
+						}
+
 						// Process regular text content (user-visible output)
 						// Continue existing text block if already in content state
 						if params.ResponseType == 1 {
 							output = output + "event: content_block_delta\n"
-							data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", partTextResult.String())
+							data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", textContent)
 							output = output + fmt.Sprintf("data: %s\n\n\n", data)
 							params.HasContent = true
 						} else {
@@ -206,13 +284,13 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 								output = output + "\n\n\n"
 								params.ResponseIndex++
 							}
-							if partTextResult.String() != "" {
+							if textContent != "" {
 								// Start a new text content block
 								output = output + "event: content_block_start\n"
 								output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex)
 								output = output + "\n\n\n"
 								output = output + "event: content_block_delta\n"
-								data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", partTextResult.String())
+								data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", textContent)
 								output = output + fmt.Sprintf("data: %s\n\n\n", data)
 								params.ResponseType = 1 // Set state to content
 								params.HasContent = true
@@ -226,6 +304,34 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 				params.HasToolUse = true
 				fcName := functionCallResult.Get("name").String()
 
+				// Handle trailingSignature: must emit via empty thinking block before FC
+				if params.TrailingSignature != "" && params.HasThinking {
+					output = output + "event: content_block_start\n"
+					output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":"","signature":""}}`, params.ResponseIndex)
+					output = output + "\n\n\n"
+					output = output + "event: content_block_delta\n"
+					output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)
+					output = output + "\n\n\n"
+					output = output + "event: content_block_delta\n"
+					sigData, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex), "delta.signature", params.TrailingSignature)
+					output = output + fmt.Sprintf("data: %s\n\n\n", sigData)
+					output = output + "event: content_block_stop\n"
+					output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+					output = output + "\n\n\n"
+					params.ResponseIndex++
+					params.TrailingSignature = ""
+					params.HasContent = true
+				} else {
+					params.TrailingSignature = "" // Discard if no thinking in this response
+				}
+
+				// Determine signature for this tool: from FC part itself or from pending empty thought
+				sigForToolCache := thoughtSignature
+				if sigForToolCache == "" {
+					sigForToolCache = params.PendingToolThoughtSignature
+				}
+				params.PendingToolThoughtSignature = ""
+
 				// Handle state transitions when switching to function calls
 				// Close any existing function call block first
 				if params.ResponseType == 3 {
@@ -234,13 +340,6 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 					output = output + "\n\n\n"
 					params.ResponseIndex++
 					params.ResponseType = 0
-				}
-
-				// Special handling for thinking state transition
-				if params.ResponseType == 2 {
-					// output = output + "event: content_block_delta\n"
-					// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, params.ResponseIndex)
-					// output = output + "\n\n\n"
 				}
 
 				// Close any other existing content block
@@ -256,10 +355,16 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 				output = output + "event: content_block_start\n"
 
 				// Create the tool use block with unique ID and function details
+				toolUseID := fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1))
 				data := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`, params.ResponseIndex)
-				data, _ = sjson.Set(data, "content_block.id", fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1)))
+				data, _ = sjson.Set(data, "content_block.id", toolUseID)
 				data, _ = sjson.Set(data, "content_block.name", fcName)
 				output = output + fmt.Sprintf("data: %s\n\n\n", data)
+
+				// Cache tool signature for next request (per Antigravity2Api's rememberToolThoughtSignature)
+				if sigForToolCache != "" && params.SessionID != "" {
+					cache.CacheSignature(params.SessionID, "tool:"+toolUseID, sigForToolCache)
+				}
 
 				if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
 					output = output + "event: content_block_delta\n"
@@ -268,6 +373,46 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 				}
 				params.ResponseType = 3
 				params.HasContent = true
+			} else {
+				// Handle inlineData (images) from the AI model
+				inlineDataResult := partResult.Get("inlineData")
+				if !inlineDataResult.Exists() {
+					inlineDataResult = partResult.Get("inline_data")
+				}
+				if inlineDataResult.Exists() {
+					data := inlineDataResult.Get("data").String()
+					if data != "" {
+						mimeType := inlineDataResult.Get("mimeType").String()
+						if mimeType == "" {
+							mimeType = inlineDataResult.Get("mime_type").String()
+						}
+						if mimeType == "" {
+							mimeType = "image/png"
+						}
+
+						// Close any existing content block
+						if params.ResponseType != 0 {
+							output = output + "event: content_block_stop\n"
+							output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+							output = output + "\n\n\n"
+							params.ResponseIndex++
+						}
+
+						// Start a new image content block
+						output = output + "event: content_block_start\n"
+						imageBlock := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"image","source":{"type":"base64","media_type":"","data":""}}}`, params.ResponseIndex)
+						imageBlock, _ = sjson.Set(imageBlock, "content_block.source.media_type", mimeType)
+						imageBlock, _ = sjson.Set(imageBlock, "content_block.source.data", data)
+						output = output + fmt.Sprintf("data: %s\n\n\n", imageBlock)
+
+						output = output + "event: content_block_stop\n"
+						output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+						output = output + "\n\n\n"
+						params.ResponseIndex++
+						params.ResponseType = 0
+						params.HasContent = true
+					}
+				}
 			}
 		}
 	}
@@ -288,6 +433,52 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 			params.CandidatesTokenCount = params.TotalTokenCount - params.PromptTokenCount - params.ThoughtsTokenCount
 			if params.CandidatesTokenCount < 0 {
 				params.CandidatesTokenCount = 0
+			}
+		}
+	}
+
+	// Detect Web Search Grounding (per Antigravity2Api's ClaudeWebSearchGrounding.js)
+	groundingMetadata := gjson.GetBytes(rawJSON, "response.candidates.0.groundingMetadata")
+	if groundingMetadata.Exists() {
+		if !params.WebSearchMode {
+			params.WebSearchMode = true
+			params.WebSearchToolUseID = fmt.Sprintf("srvtoolu_%d", atomic.AddUint64(&toolUseIDCounter, 1))
+		}
+		// Extract query
+		if queries := groundingMetadata.Get("webSearchQueries"); queries.IsArray() && len(queries.Array()) > 0 {
+			params.WebSearchQuery = queries.Array()[0].String()
+		}
+		// Extract grounding chunks as results
+		chunks := groundingMetadata.Get("groundingChunks")
+		if !chunks.Exists() {
+			chunks = gjson.GetBytes(rawJSON, "response.candidates.0.groundingChunks")
+		}
+		if chunks.IsArray() {
+			for _, chunk := range chunks.Array() {
+				web := chunk.Get("web")
+				if !web.Exists() {
+					continue
+				}
+				url := web.Get("uri").String()
+				title := web.Get("title").String()
+				if title == "" {
+					title = web.Get("domain").String()
+				}
+				// Use sjson to properly escape url and title values
+				result := `{"type":"web_search_result","url":"","title":""}`
+				result, _ = sjson.Set(result, "url", url)
+				result, _ = sjson.Set(result, "title", title)
+				params.WebSearchResults = append(params.WebSearchResults, result)
+			}
+		}
+		// Extract grounding supports
+		supports := groundingMetadata.Get("groundingSupports")
+		if !supports.Exists() {
+			supports = gjson.GetBytes(rawJSON, "response.candidates.0.groundingSupports")
+		}
+		if supports.IsArray() {
+			for _, sup := range supports.Array() {
+				params.WebSearchSupports = append(params.WebSearchSupports, sup.Raw)
 			}
 		}
 	}
@@ -313,11 +504,65 @@ func appendFinalEvents(params *Params, output *string, force bool) {
 		return
 	}
 
+	// Close current block first
 	if params.ResponseType != 0 {
 		*output = *output + "event: content_block_stop\n"
 		*output = *output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
 		*output = *output + "\n\n\n"
+		params.ResponseIndex++
 		params.ResponseType = 0
+	}
+
+	// Handle trailing signature (empty text part with signature) - must be emitted via empty thinking block
+	if params.TrailingSignature != "" && params.HasThinking {
+		*output = *output + "event: content_block_start\n"
+		*output = *output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":"","signature":""}}`, params.ResponseIndex)
+		*output = *output + "\n\n\n"
+		*output = *output + "event: content_block_delta\n"
+		*output = *output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)
+		*output = *output + "\n\n\n"
+		*output = *output + "event: content_block_delta\n"
+		sigData, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex), "delta.signature", params.TrailingSignature)
+		*output = *output + fmt.Sprintf("data: %s\n\n\n", sigData)
+		*output = *output + "event: content_block_stop\n"
+		*output = *output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+		*output = *output + "\n\n\n"
+		params.ResponseIndex++
+		params.TrailingSignature = ""
+	}
+
+	// Handle Web Search Grounding (per Antigravity2Api's emitWebSearchBlocks)
+	if params.WebSearchMode && len(params.WebSearchResults) > 0 {
+		// Emit server_tool_use block
+		*output = *output + "event: content_block_start\n"
+		toolUseBlock := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"server_tool_use","id":"%s","name":"web_search","input":{}}}`, params.ResponseIndex, params.WebSearchToolUseID)
+		*output = *output + fmt.Sprintf("data: %s\n\n\n", toolUseBlock)
+		*output = *output + "event: content_block_delta\n"
+		queryJSON := `{"query":""}`
+		queryJSON, _ = sjson.Set(queryJSON, "query", params.WebSearchQuery)
+		deltaData, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex), "delta.partial_json", queryJSON)
+		*output = *output + fmt.Sprintf("data: %s\n\n\n", deltaData)
+		*output = *output + "event: content_block_stop\n"
+		*output = *output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+		*output = *output + "\n\n\n"
+		params.ResponseIndex++
+
+		// Emit web_search_tool_result block
+		*output = *output + "event: content_block_start\n"
+		resultsJSON := "["
+		for i, r := range params.WebSearchResults {
+			if i > 0 {
+				resultsJSON += ","
+			}
+			resultsJSON += r
+		}
+		resultsJSON += "]"
+		resultBlock := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"web_search_tool_result","tool_use_id":"%s","content":%s}}`, params.ResponseIndex, params.WebSearchToolUseID, resultsJSON)
+		*output = *output + fmt.Sprintf("data: %s\n\n\n", resultBlock)
+		*output = *output + "event: content_block_stop\n"
+		*output = *output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+		*output = *output + "\n\n\n"
+		params.ResponseIndex++
 	}
 
 	stopReason := resolveStopReason(params)
@@ -339,6 +584,10 @@ func appendFinalEvents(params *Params, output *string, force bool) {
 		if err != nil {
 			log.Warnf("antigravity claude response: failed to set cache_read_input_tokens: %v", err)
 		}
+	}
+	// Add server_tool_use usage if web search was used
+	if params.WebSearchMode {
+		delta, _ = sjson.Set(delta, "usage.server_tool_use.web_search_requests", 1)
 	}
 	*output = *output + delta + "\n\n\n"
 
@@ -521,4 +770,118 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 
 func ClaudeTokenCount(ctx context.Context, count int64) string {
 	return fmt.Sprintf(`{"input_tokens":%d}`, count)
+}
+
+// processMcpXmlText parses text for MCP XML tool calls and generates tool_use blocks.
+// Returns the processed output string, remaining buffer, and whether any tool was found.
+func processMcpXmlText(text string, params *Params) (string, bool) {
+	if !params.McpXmlEnabled || len(params.McpToolNames) == 0 {
+		return "", false
+	}
+
+	output := ""
+	foundTool := false
+
+	// Combine buffer with new text
+	fullText := params.McpXmlBuffer + text
+	params.McpXmlBuffer = ""
+
+	// Create parser
+	parser := mcp.NewXmlStreamParser(params.McpToolNames)
+	results := parser.PushText(fullText)
+
+	for _, result := range results {
+		switch result.Type {
+		case "text":
+			// Keep non-tool text in buffer for possible incomplete tags
+			params.McpXmlBuffer += result.Text
+		case "tool":
+			foundTool = true
+
+			// Flush any buffered text first as regular text block
+			if params.McpXmlBuffer != "" {
+				output += emitTextBlock(params.McpXmlBuffer, params)
+				params.McpXmlBuffer = ""
+			}
+
+			// Generate tool_use block
+			output += emitMcpToolUseBlock(result.Name, result.Input, params)
+		}
+	}
+
+	return output, foundTool
+}
+
+// emitTextBlock generates a text content block for the given text.
+func emitTextBlock(text string, params *Params) string {
+	if text == "" {
+		return ""
+	}
+
+	output := ""
+
+	// Close any existing non-text block
+	if params.ResponseType != 0 && params.ResponseType != 1 {
+		output += "event: content_block_stop\n"
+		output += fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+		output += "\n\n\n"
+		params.ResponseIndex++
+		params.ResponseType = 0
+	}
+
+	if params.ResponseType == 1 {
+		// Continue existing text block
+		output += "event: content_block_delta\n"
+		data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", text)
+		output += fmt.Sprintf("data: %s\n\n\n", data)
+	} else {
+		// Start new text block
+		output += "event: content_block_start\n"
+		output += fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex)
+		output += "\n\n\n"
+		output += "event: content_block_delta\n"
+		data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", text)
+		output += fmt.Sprintf("data: %s\n\n\n", data)
+		params.ResponseType = 1
+	}
+	params.HasContent = true
+
+	return output
+}
+
+// emitMcpToolUseBlock generates a tool_use block for an MCP tool call.
+func emitMcpToolUseBlock(name string, input map[string]interface{}, params *Params) string {
+	output := ""
+
+	// Close any existing block
+	if params.ResponseType != 0 {
+		output += "event: content_block_stop\n"
+		output += fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
+		output += "\n\n\n"
+		params.ResponseIndex++
+	}
+
+	// Generate unique tool use ID
+	toolUseID := mcp.MakeToolUseID(name)
+
+	// Start tool_use block
+	output += "event: content_block_start\n"
+	data := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`, params.ResponseIndex)
+	data, _ = sjson.Set(data, "content_block.id", toolUseID)
+	data, _ = sjson.Set(data, "content_block.name", name)
+	output += fmt.Sprintf("data: %s\n\n\n", data)
+
+	// Emit input as partial JSON
+	if len(input) > 0 {
+		inputJSON, _ := json.Marshal(input)
+		output += "event: content_block_delta\n"
+		deltaData, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex), "delta.partial_json", string(inputJSON))
+		output += fmt.Sprintf("data: %s\n\n\n", deltaData)
+	}
+
+	params.ResponseType = 3 // function
+	params.HasToolUse = true
+	params.HasContent = true
+
+	return output
 }
