@@ -7,15 +7,28 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync/atomic"
 )
 
-// MCP_XML_ENV is the environment variable name to enable MCP XML mode.
+// MCP_XML_ENV is the environment variable name to control MCP XML mode.
+// Set to "0", "false", "no", or "off" to disable. Enabled by default.
 const MCP_XML_ENV = "AG2API_MCP_XML_ENABLED"
 
 var mcpToolUseIDCounter uint64
+
+// IsMcpXmlEnabled checks if MCP XML mode is enabled.
+// Returns true by default. Set AG2API_MCP_XML_ENABLED=false to disable.
+func IsMcpXmlEnabled() bool {
+	raw := os.Getenv(MCP_XML_ENV)
+	if raw == "" {
+		return true // 默认启用
+	}
+	v := strings.ToLower(strings.TrimSpace(raw))
+	return v != "0" && v != "false" && v != "no" && v != "off"
+}
 
 // IsMcpToolName checks if a tool name is an MCP tool (prefixed with "mcp__").
 func IsMcpToolName(name string) bool {

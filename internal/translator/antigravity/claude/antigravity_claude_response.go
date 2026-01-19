@@ -86,11 +86,27 @@ var toolUseIDCounter uint64
 //   - []string: A slice of strings, each containing a Claude Code-compatible JSON response
 func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
 	if *param == nil {
+		// 从原始请求中提取 MCP 工具名
+		var mcpToolNames []string
+		if mcp.IsMcpXmlEnabled() {
+			toolsResult := gjson.GetBytes(originalRequestRawJSON, "tools")
+			if toolsResult.IsArray() {
+				for _, tool := range toolsResult.Array() {
+					toolName := tool.Get("name").String()
+					if mcp.IsMcpToolName(toolName) {
+						mcpToolNames = append(mcpToolNames, toolName)
+					}
+				}
+			}
+		}
+
 		*param = &Params{
 			HasFirstResponse: false,
 			ResponseType:     0,
 			ResponseIndex:    0,
 			SessionID:        deriveSessionID(originalRequestRawJSON),
+			McpXmlEnabled:    mcp.IsMcpXmlEnabled() && len(mcpToolNames) > 0,
+			McpToolNames:     mcpToolNames,
 		}
 	}
 
